@@ -1,0 +1,11 @@
+# Binaries
+azlogs/azlogs
+clipboard/pbcopy
+clipboard/pbpaste
+
+# IDE
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
