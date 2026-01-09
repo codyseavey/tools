@@ -13,7 +13,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/codyseavey/linux-clipboard/internal/clipboard"
+	"github.com/codyseavey/tools/clipboard/internal/clipboard"
 )
 
 func main() {

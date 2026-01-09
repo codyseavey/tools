@@ -1,7 +1,7 @@
 # Binaries
-/azlogs
-/pbcopy
-/pbpaste
+azlogs/azlogs
+clipboard/pbcopy
+clipboard/pbpaste
 
 # IDE
 .idea/

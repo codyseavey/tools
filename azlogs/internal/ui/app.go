@@ -10,7 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/codyseavey/linux-clipboard/internal/azure"
+	"github.com/codyseavey/tools/azlogs/internal/azure"
 )
 
 // View represents different application views

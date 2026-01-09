@@ -6,8 +6,8 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/codyseavey/linux-clipboard/internal/azure"
-	"github.com/codyseavey/linux-clipboard/internal/ui"
+	"github.com/codyseavey/tools/azlogs/internal/azure"
+	"github.com/codyseavey/tools/azlogs/internal/ui"
 )
 
 const version = "1.0.0"
@@ -217,7 +217,7 @@ KEYBOARD SHORTCUTS (Interactive Mode):
     F3                Change workspace
     Ctrl+Q            Quit
 
-For more information, visit: https://github.com/codyseavey/linux-clipboard
+For more information, visit: https://github.com/codyseavey/tools/azlogs
 `
 	fmt.Print(help)
 }

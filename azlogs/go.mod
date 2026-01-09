@@ -1,4 +1,4 @@
-module github.com/codyseavey/linux-clipboard
+module github.com/codyseavey/tools/azlogs
 
 go 1.24.7
 
