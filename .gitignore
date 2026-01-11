@@ -3,6 +3,10 @@ azlogs/azlogs
 clipboard/pbcopy
 clipboard/pbpaste
 
+# Build output
+build/
+build-*/
+
 # IDE
 .idea/
 .vscode/
