@@ -84,7 +84,7 @@ func runInteractive(workspaceID string, auth azure.AuthMethod) {
 	fmt.Print(ui.LogoStyled())
 	fmt.Println()
 
-	// Create the model
+	// Create the model - Init() will auto-connect if workspace is provided
 	m := ui.NewModel(workspaceID, auth)
 
 	// Create and run the program
@@ -92,13 +92,6 @@ func runInteractive(workspaceID string, auth azure.AuthMethod) {
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
-
-	// If we have a workspace, try to connect
-	if workspaceID != "" {
-		go func() {
-			p.Send(tea.Cmd(m.Connect(auth)))
-		}()
-	}
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
