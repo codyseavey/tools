@@ -22,36 +22,46 @@ const (
 	ViewHistory
 	ViewHelp
 	ViewWorkspace
+	ViewRowDetail
 )
 
 // Model is the main application model
 type Model struct {
 	// Core components
-	editor       QueryEditor
-	table        ResultsTable
-	spinner      spinner.Model
+	editor         QueryEditor
+	table          ResultsTable
+	spinner        spinner.Model
 	workspaceInput textinput.Model
 
-	// Azure client
-	client   *azure.LogAnalyticsClient
-	auth     *azure.Authenticator
-	config   *azure.Config
-	history  *azure.History
+	// Azure clients
+	client       *azure.LogAnalyticsClient
+	openaiClient *azure.OpenAIClient
+	auth         *azure.Authenticator
+	authMethod   azure.AuthMethod
+	config       *azure.Config
+	history      *azure.History
 
 	// State
-	currentView   View
-	width         int
-	height        int
-	loading       bool
-	lastQuery     string
-	lastError     string
-	lastDuration  time.Duration
-	rowCount      int
-	styles        *Styles
-	connected     bool
-	workspaceID   string
-	historyIndex  int
-	historyList   []azure.HistoryEntry
+	currentView      View
+	width            int
+	height           int
+	loading          bool
+	lastQuery        string
+	lastError        string
+	lastDuration     time.Duration
+	rowCount         int
+	styles           *Styles
+	connected        bool
+	connecting       bool
+	workspaceID      string
+	historyIndex     int
+	historyList      []azure.HistoryEntry
+	detailScrollPos  int
+
+	// Autocomplete state
+	suggestion       string
+	suggestLoading   bool
+	availableTables  []string
 }
 
 // Messages
@@ -61,7 +71,20 @@ type queryResultMsg struct {
 }
 
 type connectMsg struct {
-	err error
+	err          error
+	auth         *azure.Authenticator
+	client       *azure.LogAnalyticsClient
+	openaiClient *azure.OpenAIClient
+}
+
+type suggestionMsg struct {
+	suggestion string
+	err        error
+}
+
+type tablesMsg struct {
+	tables []string
+	err    error
 }
 
 // NewModel creates a new application model
@@ -92,18 +115,27 @@ func NewModel(workspaceID string, authMethod azure.AuthMethod) Model {
 		workspaceInput: wi,
 		config:         config,
 		history:        history,
+		authMethod:     authMethod,
 		currentView:    ViewQuery,
 		styles:         DefaultStyles(),
 		workspaceID:    workspaceID,
+		connecting:     workspaceID != "", // Start connecting if workspace provided
 	}
 }
 
 // Init initializes the model
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		m.editor.Init(),
 		m.spinner.Tick,
-	)
+	}
+
+	// Auto-connect if workspace is provided
+	if m.workspaceID != "" {
+		cmds = append(cmds, m.Connect(m.authMethod))
+	}
+
+	return tea.Batch(cmds...)
 }
 
 // Connect connects to Azure
@@ -111,19 +143,18 @@ func (m *Model) Connect(authMethod azure.AuthMethod) tea.Cmd {
 	return func() tea.Msg {
 		auth, err := azure.NewAuthenticator(authMethod)
 		if err != nil {
-			return connectMsg{err: err}
+			return connectMsg{err: err, auth: nil, client: nil, openaiClient: nil}
 		}
 
 		client, err := azure.NewLogAnalyticsClient(auth.GetCredential(), m.workspaceID)
 		if err != nil {
-			return connectMsg{err: err}
+			return connectMsg{err: err, auth: nil, client: nil, openaiClient: nil}
 		}
 
-		m.auth = auth
-		m.client = client
-		m.connected = true
+		// Create OpenAI client for autocomplete
+		openaiClient := azure.NewOpenAIClientWithDefaults(auth.GetCredential())
 
-		return connectMsg{err: nil}
+		return connectMsg{err: nil, auth: auth, client: client, openaiClient: openaiClient}
 	}
 }
 
@@ -151,7 +182,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "f2":
-			m.showHistory()
+			m.historyList = m.history.GetRecent(50)
+			m.historyIndex = 0
+			m.currentView = ViewHistory
 			return m, nil
 
 		case "f3":
@@ -180,6 +213,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateHelpView(msg)
 		case ViewWorkspace:
 			return m.updateWorkspaceView(msg)
+		case ViewRowDetail:
+			return m.updateRowDetailView(msg)
 		}
 
 	case spinner.TickMsg:
@@ -200,12 +235,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case connectMsg:
+		m.connecting = false
 		if msg.err != nil {
 			m.lastError = fmt.Sprintf("Connection failed: %v", msg.err)
 			m.connected = false
 		} else {
+			m.auth = msg.auth
+			m.client = msg.client
+			m.openaiClient = msg.openaiClient
 			m.connected = true
 			m.lastError = ""
+			// Load available tables for autocomplete context
+			return m, m.loadAvailableTables()
+		}
+		return m, nil
+
+	case suggestionMsg:
+		m.suggestLoading = false
+		if msg.err != nil {
+			// Silently ignore suggestion errors
+			m.suggestion = ""
+		} else {
+			m.suggestion = msg.suggestion
+		}
+		return m, nil
+
+	case tablesMsg:
+		if msg.err == nil {
+			m.availableTables = msg.tables
 		}
 		return m, nil
 	}
@@ -220,27 +277,61 @@ func (m Model) updateQueryView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.lastError = "Not connected. Press F3 to set workspace."
 			return m, nil
 		}
+		m.suggestion = "" // Clear any pending suggestion
 		return m.executeQuery()
 
 	case "tab":
+		// Accept suggestion if available, otherwise switch to results
+		if m.suggestion != "" {
+			m.editor.SetValue(m.suggestion)
+			m.suggestion = ""
+			return m, nil
+		}
 		m.currentView = ViewResults
 		m.editor.Blur()
 		m.table.Focus()
 		return m, nil
 
+	case "ctrl+ ": // Ctrl+Space to trigger autocomplete
+		if !m.connected || m.openaiClient == nil {
+			m.lastError = "Connect to workspace first for AI suggestions"
+			return m, nil
+		}
+		if m.suggestLoading {
+			return m, nil // Already loading
+		}
+		m.suggestLoading = true
+		m.suggestion = ""
+		return m, m.getSuggestion()
+
 	case "ctrl+l":
 		m.editor.Reset()
+		m.suggestion = ""
 		return m, nil
+
+	case "esc":
+		// Clear suggestion if present
+		if m.suggestion != "" {
+			m.suggestion = ""
+			return m, nil
+		}
 
 	case "up":
 		// Navigate history when editor is empty or at top
 		if m.editor.Value() == "" || m.historyIndex > 0 {
+			m.suggestion = "" // Clear suggestion when navigating history
 			return m.navigateHistory(-1)
 		}
 	case "down":
 		if m.historyIndex < len(m.historyList)-1 {
+			m.suggestion = "" // Clear suggestion when navigating history
 			return m.navigateHistory(1)
 		}
+	}
+
+	// Clear suggestion when typing
+	if len(msg.String()) == 1 || msg.String() == "backspace" || msg.String() == "delete" {
+		m.suggestion = ""
 	}
 
 	var cmd tea.Cmd
@@ -254,6 +345,14 @@ func (m Model) updateResultsView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.currentView = ViewQuery
 		m.table.Blur()
 		m.editor.Focus()
+		return m, nil
+
+	case "enter":
+		// Open row detail view
+		if m.table.RowCount() > 0 {
+			m.detailScrollPos = 0
+			m.currentView = ViewRowDetail
+		}
 		return m, nil
 
 	case "y":
@@ -310,12 +409,66 @@ func (m Model) updateWorkspaceView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.currentView = ViewQuery
 		m.editor.Focus()
-		return m, m.Connect(azure.AuthDefault)
+		m.connecting = true
+		m.connected = false
+		return m, m.Connect(m.authMethod)
 	}
 
 	var cmd tea.Cmd
 	m.workspaceInput, cmd = m.workspaceInput.Update(msg)
 	return m, cmd
+}
+
+func (m Model) updateRowDetailView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	row := m.table.GetSelectedRow()
+	columns := m.table.GetColumns()
+	maxScroll := len(columns) - 1
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+
+	switch msg.String() {
+	case "esc", "q", "enter":
+		m.currentView = ViewResults
+		return m, nil
+
+	case "up", "k":
+		if m.detailScrollPos > 0 {
+			m.detailScrollPos--
+		}
+		return m, nil
+
+	case "down", "j":
+		if m.detailScrollPos < maxScroll {
+			m.detailScrollPos++
+		}
+		return m, nil
+
+	case "home", "g":
+		m.detailScrollPos = 0
+		return m, nil
+
+	case "end", "G":
+		m.detailScrollPos = maxScroll
+		return m, nil
+
+	case "pgup":
+		m.detailScrollPos -= 10
+		if m.detailScrollPos < 0 {
+			m.detailScrollPos = 0
+		}
+		return m, nil
+
+	case "pgdown":
+		m.detailScrollPos += 10
+		if m.detailScrollPos > maxScroll {
+			m.detailScrollPos = maxScroll
+		}
+		return m, nil
+	}
+
+	_ = row // Suppress unused warning
+	return m, nil
 }
 
 func (m Model) executeQuery() (tea.Model, tea.Cmd) {
@@ -371,12 +524,6 @@ func (m *Model) processResults(result *azure.QueryResult) {
 	m.table.Focus()
 }
 
-func (m Model) showHistory() {
-	m.historyList = m.history.GetRecent(50)
-	m.historyIndex = 0
-	m.currentView = ViewHistory
-}
-
 func (m Model) navigateHistory(delta int) (tea.Model, tea.Cmd) {
 	if len(m.historyList) == 0 {
 		m.historyList = m.history.GetRecent(50)
@@ -416,6 +563,36 @@ func (m *Model) saveState() {
 	m.config.Save()
 }
 
+// loadAvailableTables fetches available tables for autocomplete context
+func (m *Model) loadAvailableTables() tea.Cmd {
+	return func() tea.Msg {
+		if m.client == nil {
+			return tablesMsg{err: fmt.Errorf("not connected")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		tables, err := m.client.GetAvailableTables(ctx)
+		return tablesMsg{tables: tables, err: err}
+	}
+}
+
+// getSuggestion fetches a query suggestion from OpenAI
+func (m *Model) getSuggestion() tea.Cmd {
+	return func() tea.Msg {
+		if m.openaiClient == nil {
+			return suggestionMsg{err: fmt.Errorf("OpenAI not available")}
+		}
+		query := m.editor.Value()
+		if query == "" {
+			return suggestionMsg{err: fmt.Errorf("empty query")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		suggestion, err := m.openaiClient.SuggestKQLQuery(ctx, query, m.availableTables)
+		return suggestionMsg{suggestion: suggestion, err: err}
+	}
+}
+
 // View renders the UI
 func (m Model) View() string {
 	var b strings.Builder
@@ -438,6 +615,8 @@ func (m Model) View() string {
 		b.WriteString(m.renderHelpView())
 	case ViewWorkspace:
 		b.WriteString(m.renderWorkspaceView())
+	case ViewRowDetail:
+		b.WriteString(m.renderRowDetailView())
 	}
 
 	// Error message
@@ -464,6 +643,8 @@ func (m Model) renderStatusBar() string {
 	// Connection status
 	if m.connected {
 		parts = append(parts, m.styles.Success.Render("● Connected"))
+	} else if m.connecting {
+		parts = append(parts, m.spinner.View()+" "+m.styles.Warning.Render("Connecting..."))
 	} else {
 		parts = append(parts, m.styles.Error.Render("○ Disconnected"))
 	}
@@ -496,6 +677,23 @@ func (m Model) renderMainView() string {
 
 	// Query editor
 	b.WriteString(m.editor.View())
+
+	// Show suggestion or loading indicator
+	if m.suggestLoading {
+		b.WriteString("\n")
+		b.WriteString(m.spinner.View() + " " + m.styles.Muted.Render("Getting AI suggestion..."))
+	} else if m.suggestion != "" {
+		b.WriteString("\n")
+		b.WriteString(m.styles.Subtitle.Render("AI Suggestion (Tab to accept, Esc to dismiss):"))
+		b.WriteString("\n")
+		// Show suggestion in a box
+		suggestionBox := m.styles.Box.
+			BorderForeground(ColorSecondary).
+			Width(m.width - 8).
+			Render(m.suggestion)
+		b.WriteString(suggestionBox)
+	}
+
 	b.WriteString("\n\n")
 
 	// Results table
@@ -558,17 +756,20 @@ NAVIGATION
   F1            Show this help
   F2            Show query history
   F3            Change workspace
-  Esc           Return to query view
+  Esc           Return to query view / Dismiss suggestion
   Ctrl+Q        Quit
 
 QUERY EDITOR
   F5, Ctrl+Enter   Execute query
+  Ctrl+Space       AI query suggestion (Azure OpenAI)
+  Tab              Accept AI suggestion (when shown)
   Ctrl+L           Clear editor
   Up/Down          Navigate query history
 
 RESULTS TABLE
   j/k, Up/Down     Navigate rows
   h/l, Left/Right  Scroll columns
+  Enter            View row details (full content)
   PgUp/PgDown      Page navigation
   Home/End, g/G    Jump to start/end
 
@@ -609,6 +810,91 @@ func (m Model) renderWorkspaceView() string {
 	return b.String()
 }
 
+func (m Model) renderRowDetailView() string {
+	var b strings.Builder
+
+	row := m.table.GetSelectedRow()
+	columns := m.table.GetColumns()
+	rowIdx := m.table.GetSelectedRowIndex()
+
+	b.WriteString(m.styles.Header.Render(fmt.Sprintf("Row Detail (Row %d/%d)", rowIdx+1, m.table.RowCount())))
+	b.WriteString("\n\n")
+
+	if row == nil || len(columns) == 0 {
+		b.WriteString(m.styles.Muted.Render("No row selected"))
+		return b.String()
+	}
+
+	// Calculate visible rows based on height
+	visibleRows := m.height - 12
+	if visibleRows < 5 {
+		visibleRows = 5
+	}
+
+	// Show fields with scroll
+	endIdx := m.detailScrollPos + visibleRows
+	if endIdx > len(columns) {
+		endIdx = len(columns)
+	}
+
+	// Calculate max column name width for alignment
+	maxNameWidth := 0
+	for _, col := range columns {
+		if len(col) > maxNameWidth {
+			maxNameWidth = len(col)
+		}
+	}
+	if maxNameWidth > 30 {
+		maxNameWidth = 30
+	}
+
+	for i := m.detailScrollPos; i < endIdx && i < len(row); i++ {
+		colName := columns[i]
+		value := row[i]
+
+		// Highlight current scroll position
+		prefix := "  "
+		if i == m.detailScrollPos {
+			prefix = "▶ "
+		}
+
+		// Format column name with padding
+		paddedName := colName
+		if len(paddedName) > maxNameWidth {
+			paddedName = paddedName[:maxNameWidth-3] + "..."
+		}
+		for len(paddedName) < maxNameWidth {
+			paddedName += " "
+		}
+
+		// Format value - wrap long values
+		valueStr := value
+		if valueStr == "" {
+			valueStr = m.styles.Muted.Render("(empty)")
+		}
+
+		line := fmt.Sprintf("%s%s: %s",
+			prefix,
+			m.styles.Bold.Foreground(ColorSecondary).Render(paddedName),
+			valueStr)
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+
+	// Scroll indicator
+	if len(columns) > visibleRows {
+		b.WriteString("\n")
+		scrollInfo := fmt.Sprintf("Showing fields %d-%d of %d (scroll with j/k or arrows)",
+			m.detailScrollPos+1, endIdx, len(columns))
+		b.WriteString(m.styles.Muted.Render(scrollInfo))
+	}
+
+	b.WriteString("\n\n")
+	b.WriteString(m.styles.Muted.Render("Press Esc, Enter, or Q to return to results"))
+
+	return b.String()
+}
+
 func (m Model) renderFooter() string {
 	var keys []string
 
@@ -616,17 +902,23 @@ func (m Model) renderFooter() string {
 	case ViewQuery:
 		keys = []string{
 			m.styles.HelpKey.Render("F5") + " Execute",
+			m.styles.HelpKey.Render("Ctrl+Space") + " AI Suggest",
 			m.styles.HelpKey.Render("Tab") + " Results",
-			m.styles.HelpKey.Render("F1") + " Help",
 			m.styles.HelpKey.Render("F2") + " History",
 			m.styles.HelpKey.Render("F3") + " Workspace",
 			m.styles.HelpKey.Render("Ctrl+Q") + " Quit",
 		}
 	case ViewResults:
 		keys = []string{
+			m.styles.HelpKey.Render("Enter") + " Details",
 			m.styles.HelpKey.Render("Tab") + " Editor",
 			m.styles.HelpKey.Render("j/k") + " Navigate",
 			m.styles.HelpKey.Render("h/l") + " Scroll",
+			m.styles.HelpKey.Render("Esc") + " Back",
+		}
+	case ViewRowDetail:
+		keys = []string{
+			m.styles.HelpKey.Render("j/k") + " Scroll",
 			m.styles.HelpKey.Render("Esc") + " Back",
 		}
 	case ViewHistory:

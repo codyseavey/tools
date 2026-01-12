@@ -282,6 +282,16 @@ func (t ResultsTable) GetSelectedRow() []string {
 	return nil
 }
 
+// GetColumns returns the column names
+func (t ResultsTable) GetColumns() []string {
+	return t.columns
+}
+
+// GetSelectedRowIndex returns the current cursor position
+func (t ResultsTable) GetSelectedRowIndex() int {
+	return t.cursor
+}
+
 // Helper functions
 
 func truncateString(s string, maxLen int) string {
