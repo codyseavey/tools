@@ -18,7 +18,7 @@ import (
 const (
 	DefaultOpenAIResourceID = "/subscriptions/dc216e0e-5d8f-470b-8f7d-fddec411fc68/resourceGroups/evue2-mgmtopenai-rg/providers/Microsoft.CognitiveServices/accounts/evue2-mgmtopenai"
 	DefaultOpenAIEndpoint   = "https://evue2-mgmtopenai.openai.azure.com"
-	DefaultDeploymentName   = "gpt-4o-mini" // Common deployment name, adjust as needed
+	DefaultDeploymentName   = "gpt-5.1-codex-mini"
 	OpenAIAPIVersion        = "2024-02-15-preview"
 )
 
@@ -150,8 +150,14 @@ func (c *OpenAIClient) Complete(ctx context.Context, messages []ChatMessage, max
 	return completionResp.Choices[0].Message.Content, nil
 }
 
+// TableSchema represents a table and its columns for context
+type TableSchema struct {
+	Name    string
+	Columns []Column
+}
+
 // SuggestKQLQuery suggests a KQL query completion based on the current input
-func (c *OpenAIClient) SuggestKQLQuery(ctx context.Context, partialQuery string, availableTables []string) (string, error) {
+func (c *OpenAIClient) SuggestKQLQuery(ctx context.Context, partialQuery string, availableTables []string, schemas map[string][]Column) (string, error) {
 	systemPrompt := `You are a KQL (Kusto Query Language) expert assistant for Azure Log Analytics.
 Your task is to complete or suggest KQL queries based on partial input.
 
@@ -159,13 +165,33 @@ Guidelines:
 - Complete the query in a syntactically correct way
 - Keep suggestions concise and relevant
 - If the query looks complete, suggest improvements or variations
-- Use common Log Analytics tables when appropriate
+- Use the available tables and their schemas when provided
 - Focus on practical, commonly-used query patterns
-- Only output the query suggestion, no explanations`
+- Only output the query suggestion, no explanations
+- When filtering or projecting, use actual column names from the schema`
 
 	if len(availableTables) > 0 {
 		tableList := strings.Join(availableTables, ", ")
 		systemPrompt += fmt.Sprintf("\n\nAvailable tables in this workspace: %s", tableList)
+	}
+
+	// Add schema information for referenced tables
+	if len(schemas) > 0 {
+		systemPrompt += "\n\nTable schemas (table: columns with types):"
+		for tableName, columns := range schemas {
+			if len(columns) > 0 {
+				var colStrs []string
+				for _, col := range columns {
+					colStrs = append(colStrs, fmt.Sprintf("%s (%s)", col.Name, col.Type))
+				}
+				// Limit columns shown to avoid token overflow
+				if len(colStrs) > 30 {
+					colStrs = colStrs[:30]
+					colStrs = append(colStrs, "...")
+				}
+				systemPrompt += fmt.Sprintf("\n- %s: %s", tableName, strings.Join(colStrs, ", "))
+			}
+		}
 	}
 
 	userPrompt := fmt.Sprintf("Complete or suggest a KQL query based on this input:\n%s", partialQuery)

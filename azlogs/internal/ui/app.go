@@ -62,6 +62,7 @@ type Model struct {
 	suggestion       string
 	suggestLoading   bool
 	availableTables  []string
+	schemaCache      map[string][]azure.Column // Cache of table schemas
 }
 
 // Messages
@@ -85,6 +86,12 @@ type suggestionMsg struct {
 type tablesMsg struct {
 	tables []string
 	err    error
+}
+
+type schemaMsg struct {
+	tableName string
+	columns   []azure.Column
+	err       error
 }
 
 // NewModel creates a new application model
@@ -120,6 +127,7 @@ func NewModel(workspaceID string, authMethod azure.AuthMethod) Model {
 		styles:         DefaultStyles(),
 		workspaceID:    workspaceID,
 		connecting:     workspaceID != "", // Start connecting if workspace provided
+		schemaCache:    make(map[string][]azure.Column),
 	}
 }
 
@@ -263,6 +271,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tablesMsg:
 		if msg.err == nil {
 			m.availableTables = msg.tables
+		}
+		return m, nil
+
+	case schemaMsg:
+		if msg.err == nil && msg.tableName != "" {
+			if m.schemaCache == nil {
+				m.schemaCache = make(map[string][]azure.Column)
+			}
+			m.schemaCache[msg.tableName] = msg.columns
 		}
 		return m, nil
 	}
@@ -586,11 +603,78 @@ func (m *Model) getSuggestion() tea.Cmd {
 		if query == "" {
 			return suggestionMsg{err: fmt.Errorf("empty query")}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		suggestion, err := m.openaiClient.SuggestKQLQuery(ctx, query, m.availableTables)
+
+		// Parse tables from the query and fetch their schemas
+		referencedTables := m.parseTablesFromQuery(query)
+		schemas := m.fetchSchemasForTables(ctx, referencedTables)
+
+		suggestion, err := m.openaiClient.SuggestKQLQuery(ctx, query, m.availableTables, schemas)
 		return suggestionMsg{suggestion: suggestion, err: err}
 	}
+}
+
+// parseTablesFromQuery extracts table names from a KQL query
+func (m *Model) parseTablesFromQuery(query string) []string {
+	var tables []string
+	seen := make(map[string]bool)
+
+	// Check if any available table name appears at the start of the query
+	// or after a pipe, union, or join
+	queryLower := strings.ToLower(query)
+
+	for _, table := range m.availableTables {
+		tableLower := strings.ToLower(table)
+
+		// Check various positions where a table name might appear
+		patterns := []string{
+			tableLower,                    // At the start or anywhere
+			"| " + tableLower,             // After pipe
+			"|" + tableLower,              // After pipe (no space)
+			"union " + tableLower,         // In union
+			"join " + tableLower,          // In join
+			"join (" + tableLower,         // In join with paren
+		}
+
+		for _, pattern := range patterns {
+			if strings.Contains(queryLower, pattern) {
+				if !seen[table] {
+					tables = append(tables, table)
+					seen[table] = true
+				}
+				break
+			}
+		}
+	}
+
+	return tables
+}
+
+// fetchSchemasForTables fetches schemas for the given tables, using cache when available
+func (m *Model) fetchSchemasForTables(ctx context.Context, tables []string) map[string][]azure.Column {
+	schemas := make(map[string][]azure.Column)
+
+	for _, table := range tables {
+		// Check cache first
+		if cached, ok := m.schemaCache[table]; ok {
+			schemas[table] = cached
+			continue
+		}
+
+		// Fetch from Log Analytics if not cached
+		if m.client != nil {
+			columns, err := m.client.GetTableSchema(ctx, table)
+			if err == nil && len(columns) > 0 {
+				schemas[table] = columns
+				// Note: Can't update schemaCache here as this runs in a goroutine
+				// The cache will be updated via schemaMsg if needed
+			}
+		}
+	}
+
+	return schemas
 }
 
 // View renders the UI
