@@ -2,6 +2,11 @@
 azlogs/azlogs
 clipboard/pbcopy
 clipboard/pbpaste
+clipboard/pbcopy-*
+clipboard/pbpaste-*
+
+# Claude
+.claude/
 
 # Build output
 build/

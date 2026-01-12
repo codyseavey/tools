@@ -148,13 +148,14 @@ func (m Model) Init() tea.Cmd {
 
 // Connect connects to Azure
 func (m *Model) Connect(authMethod azure.AuthMethod) tea.Cmd {
+	workspaceID := m.workspaceID
 	return func() tea.Msg {
 		auth, err := azure.NewAuthenticator(authMethod)
 		if err != nil {
 			return connectMsg{err: err, auth: nil, client: nil, openaiClient: nil}
 		}
 
-		client, err := azure.NewLogAnalyticsClient(auth.GetCredential(), m.workspaceID)
+		client, err := azure.NewLogAnalyticsClient(auth.GetCredential(), workspaceID)
 		if err != nil {
 			return connectMsg{err: err, auth: nil, client: nil, openaiClient: nil}
 		}

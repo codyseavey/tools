@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -116,7 +117,7 @@ func runNonInteractive(workspaceID, query string, authMethod azure.AuthMethod) {
 
 	// Execute query
 	fmt.Fprintf(os.Stderr, "Executing query...\n")
-	result, err := client.Query(nil, query, nil)
+	result, err := client.Query(context.Background(), query, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		os.Exit(1)
