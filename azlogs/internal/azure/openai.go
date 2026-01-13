@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,8 +19,8 @@ import (
 const (
 	DefaultOpenAIResourceID = "/subscriptions/dc216e0e-5d8f-470b-8f7d-fddec411fc68/resourceGroups/evue2-mgmtopenai-rg/providers/Microsoft.CognitiveServices/accounts/evue2-mgmtopenai"
 	DefaultOpenAIEndpoint   = "https://evue2-mgmtopenai.openai.azure.com"
-	DefaultDeploymentName   = "gpt-5.1-codex-mini"
-	OpenAIAPIVersion        = "2024-02-15-preview"
+	DefaultDeploymentName   = "gpt-4o-mini"
+	OpenAIAPIVersion        = "2024-12-01-preview"
 )
 
 // OpenAIClient handles Azure OpenAI API calls
@@ -38,10 +39,10 @@ type ChatMessage struct {
 
 // ChatCompletionRequest represents a request to the chat completions API
 type ChatCompletionRequest struct {
-	Messages    []ChatMessage `json:"messages"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Temperature float64       `json:"temperature,omitempty"`
-	Stop        []string      `json:"stop,omitempty"`
+	Messages            []ChatMessage `json:"messages"`
+	MaxCompletionTokens int           `json:"max_completion_tokens,omitempty"`
+	Temperature         float64       `json:"temperature,omitempty"`
+	Stop                []string      `json:"stop,omitempty"`
 }
 
 // ChatCompletionResponse represents the response from chat completions API
@@ -98,9 +99,9 @@ func (c *OpenAIClient) Complete(ctx context.Context, messages []ChatMessage, max
 	}
 
 	reqBody := ChatCompletionRequest{
-		Messages:    messages,
-		MaxTokens:   maxTokens,
-		Temperature: 0.3, // Lower temperature for more deterministic completions
+		Messages:            messages,
+		MaxCompletionTokens: maxTokens,
+		// Note: temperature omitted as gpt-5.2-chat only supports default value (1)
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -162,13 +163,12 @@ func (c *OpenAIClient) SuggestKQLQuery(ctx context.Context, partialQuery string,
 Your task is to complete or suggest KQL queries based on partial input.
 
 Guidelines:
-- Complete the query in a syntactically correct way
-- Keep suggestions concise and relevant
-- If the query looks complete, suggest improvements or variations
-- Use the available tables and their schemas when provided
-- Focus on practical, commonly-used query patterns
-- Only output the query suggestion, no explanations
-- When filtering or projecting, use actual column names from the schema`
+- Output ONLY the raw KQL query. No markdown, no explanations.
+- If the input is already a partial query, complete it.
+- If the input is a natural language question, translate it to KQL.
+- IMPORTANT: Do NOT repeat the user's input if it's already part of the query. Just provide the FULL valid query.
+- Ensure the query uses valid column names from the provided schema.
+- Do not add 'kql' or code block markers.`
 
 	if len(availableTables) > 0 {
 		tableList := strings.Join(availableTables, ", ")
@@ -185,8 +185,8 @@ Guidelines:
 					colStrs = append(colStrs, fmt.Sprintf("%s (%s)", col.Name, col.Type))
 				}
 				// Limit columns shown to avoid token overflow
-				if len(colStrs) > 30 {
-					colStrs = colStrs[:30]
+				if len(colStrs) > 100 {
+					colStrs = colStrs[:100]
 					colStrs = append(colStrs, "...")
 				}
 				systemPrompt += fmt.Sprintf("\n- %s: %s", tableName, strings.Join(colStrs, ", "))
@@ -201,7 +201,26 @@ Guidelines:
 		{Role: "user", Content: userPrompt},
 	}
 
-	return c.Complete(ctx, messages, 500)
+	resp, err := c.Complete(ctx, messages, 500)
+	if err != nil {
+		return "", err
+	}
+
+	// Clean up response using regex to find code blocks
+	resp = strings.TrimSpace(resp)
+
+	// Regex to match markdown code blocks: ```kql ... ``` or ``` ... ```
+	re := regexp.MustCompile("(?s)```(?:kql)?\\s*(.*?)\\s*```")
+	match := re.FindStringSubmatch(resp)
+	if len(match) > 1 {
+		return strings.TrimSpace(match[1]), nil
+	}
+
+	// If no code block, try to clean up raw response
+	resp = strings.TrimPrefix(resp, "```kql")
+	resp = strings.TrimPrefix(resp, "```")
+	resp = strings.TrimSuffix(resp, "```")
+	return strings.TrimSpace(resp), nil
 }
 
 // ExplainKQLQuery explains what a KQL query does

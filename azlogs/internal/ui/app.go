@@ -23,6 +23,7 @@ const (
 	ViewHelp
 	ViewWorkspace
 	ViewRowDetail
+	ViewTemplates
 )
 
 // Model is the main application model
@@ -57,12 +58,25 @@ type Model struct {
 	historyIndex     int
 	historyList      []azure.HistoryEntry
 	detailScrollPos  int
+	hideEmptyFields  bool // Hide empty/null fields in row detail view
 
 	// Autocomplete state
-	suggestion       string
-	suggestLoading   bool
-	availableTables  []string
-	schemaCache      map[string][]azure.Column // Cache of table schemas
+	suggestion            string
+	suggestLoading        bool
+	suggestionDebounceTag int
+	availableTables       []string
+	schemaCache           map[string][]azure.Column // Cache of table schemas
+
+	// Local autocomplete
+	autocompleteEngine *AutocompleteEngine
+	suggestionPopup    *SuggestionPopup
+
+	// Templates state
+	templates      *azure.Templates
+	templateList   []azure.TemplateEntry
+	templateIndex  int
+	templateInput  textinput.Model
+	savingTemplate bool
 }
 
 // Messages
@@ -81,6 +95,11 @@ type connectMsg struct {
 type suggestionMsg struct {
 	suggestion string
 	err        error
+	tag        int
+}
+
+type debounceMsg struct {
+	tag int
 }
 
 type tablesMsg struct {
@@ -92,6 +111,13 @@ type schemaMsg struct {
 	tableName string
 	columns   []azure.Column
 	err       error
+}
+
+// waitForDebounce waits for a short period before triggering autocomplete
+func waitForDebounce(tag int) tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(_ time.Time) tea.Msg {
+		return debounceMsg{tag: tag}
+	})
 }
 
 // NewModel creates a new application model
@@ -115,19 +141,32 @@ func NewModel(workspaceID string, authMethod azure.AuthMethod) Model {
 	history := azure.NewHistory(1000)
 	history.Load()
 
+	templates := azure.NewTemplates()
+	templates.Load()
+
+	ti := textinput.New()
+	ti.Placeholder = "Enter template name"
+	ti.CharLimit = 100
+	ti.Width = 40
+
 	return Model{
-		editor:         NewQueryEditor(),
-		table:          NewResultsTable(),
-		spinner:        s,
-		workspaceInput: wi,
-		config:         config,
-		history:        history,
-		authMethod:     authMethod,
-		currentView:    ViewQuery,
-		styles:         DefaultStyles(),
-		workspaceID:    workspaceID,
-		connecting:     workspaceID != "", // Start connecting if workspace provided
-		schemaCache:    make(map[string][]azure.Column),
+		editor:             NewQueryEditor(),
+		table:              NewResultsTable(),
+		spinner:            s,
+		workspaceInput:     wi,
+		config:             config,
+		history:            history,
+		authMethod:         authMethod,
+		currentView:        ViewQuery,
+		styles:             DefaultStyles(),
+		workspaceID:        workspaceID,
+		connecting:         workspaceID != "", // Start connecting if workspace provided
+		schemaCache:        make(map[string][]azure.Column),
+		hideEmptyFields:    true, // Hide empty fields by default
+		autocompleteEngine: NewAutocompleteEngine(),
+		suggestionPopup:    NewSuggestionPopup(),
+		templates:          templates,
+		templateInput:      ti,
 	}
 }
 
@@ -201,6 +240,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.workspaceInput.Focus()
 			return m, nil
 
+		case "f4":
+			m.templateList = m.templates.GetAll()
+			m.templateIndex = 0
+			m.currentView = ViewTemplates
+			return m, nil
+
 		case "esc":
 			if m.currentView != ViewQuery {
 				m.currentView = ViewQuery
@@ -224,6 +269,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateWorkspaceView(msg)
 		case ViewRowDetail:
 			return m.updateRowDetailView(msg)
+		case ViewTemplates:
+			return m.updateTemplatesView(msg)
 		}
 
 	case spinner.TickMsg:
@@ -260,18 +307,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case suggestionMsg:
-		m.suggestLoading = false
-		if msg.err != nil {
-			// Silently ignore suggestion errors
-			m.suggestion = ""
-		} else {
-			m.suggestion = msg.suggestion
+		if msg.tag == m.suggestionDebounceTag {
+			m.suggestLoading = false
+			if msg.err != nil {
+				// Silently ignore suggestion errors
+				m.suggestion = ""
+			} else {
+				m.suggestion = msg.suggestion
+			}
+		}
+		return m, nil
+
+	case debounceMsg:
+		if msg.tag == m.suggestionDebounceTag {
+			if !m.connected || m.openaiClient == nil {
+				return m, nil
+			}
+			m.suggestLoading = true
+			return m, m.getSuggestion(m.suggestionDebounceTag)
 		}
 		return m, nil
 
 	case tablesMsg:
 		if msg.err == nil {
 			m.availableTables = msg.tables
+			m.autocompleteEngine.SetTables(msg.tables)
+			return m, m.fetchInitialSchemas(msg.tables)
 		}
 		return m, nil
 
@@ -281,6 +342,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.schemaCache = make(map[string][]azure.Column)
 			}
 			m.schemaCache[msg.tableName] = msg.columns
+			m.autocompleteEngine.SetSchemas(m.schemaCache)
 		}
 		return m, nil
 	}
@@ -289,6 +351,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateQueryView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Handle popup navigation first if popup is visible
+	if m.suggestionPopup.IsVisible() {
+		switch msg.String() {
+		case "up", "ctrl+p":
+			m.suggestionPopup.Previous()
+			return m, nil
+		case "down", "ctrl+n":
+			m.suggestionPopup.Next()
+			return m, nil
+		case "tab", "enter":
+			// Accept selected suggestion
+			if selected := m.suggestionPopup.GetSelectedText(); selected != "" {
+				m.acceptLocalSuggestion(selected)
+			}
+			m.suggestionPopup.Hide()
+			return m, nil
+		case "esc":
+			m.suggestionPopup.Hide()
+			return m, nil
+		}
+	}
+
 	switch msg.String() {
 	case "ctrl+enter", "f5":
 		if !m.connected {
@@ -296,10 +380,11 @@ func (m Model) updateQueryView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.suggestion = "" // Clear any pending suggestion
+		m.suggestionPopup.Hide()
 		return m.executeQuery()
 
 	case "tab":
-		// Accept suggestion if available, otherwise switch to results
+		// Accept AI suggestion if available, otherwise switch to results
 		if m.suggestion != "" {
 			m.editor.SetValue(m.suggestion)
 			m.suggestion = ""
@@ -310,50 +395,67 @@ func (m Model) updateQueryView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.table.Focus()
 		return m, nil
 
-	case "ctrl+ ": // Ctrl+Space to trigger autocomplete
+	case "ctrl+@", "ctrl+ ", "alt+s": // Ctrl+Space or Alt+S to manually trigger AI autocomplete
 		if !m.connected || m.openaiClient == nil {
 			m.lastError = "Connect to workspace first for AI suggestions"
 			return m, nil
 		}
-		if m.suggestLoading {
-			return m, nil // Already loading
-		}
+		m.suggestionDebounceTag++
+		tag := m.suggestionDebounceTag
 		m.suggestLoading = true
 		m.suggestion = ""
-		return m, m.getSuggestion()
+		m.suggestionPopup.Hide()
+		return m, m.getSuggestion(tag)
 
 	case "ctrl+l":
 		m.editor.Reset()
 		m.suggestion = ""
+		m.suggestionPopup.Hide()
 		return m, nil
 
+	case "ctrl+s", "f6":
+		// Save current query as template
+		if m.editor.Value() != "" {
+			m.savingTemplate = true
+			m.templateInput.SetValue("")
+			m.templateInput.Focus()
+			return m, nil
+		}
+
 	case "esc":
-		// Clear suggestion if present
+		// Clear AI suggestion if present
 		if m.suggestion != "" {
 			m.suggestion = ""
 			return m, nil
 		}
 
-	case "up":
-		// Navigate history when editor is empty or at top
-		if m.editor.Value() == "" || m.historyIndex > 0 {
-			m.suggestion = "" // Clear suggestion when navigating history
-			return m.navigateHistory(-1)
-		}
-	case "down":
-		if m.historyIndex < len(m.historyList)-1 {
-			m.suggestion = "" // Clear suggestion when navigating history
-			return m.navigateHistory(1)
-		}
-	}
+	case "ctrl+up":
+		// Navigate history
+		m.suggestion = "" // Clear suggestion when navigating history
+		m.suggestionPopup.Hide()
+		return m.navigateHistory(-1)
 
-	// Clear suggestion when typing
-	if len(msg.String()) == 1 || msg.String() == "backspace" || msg.String() == "delete" {
-		m.suggestion = ""
+	case "ctrl+down":
+		// Navigate history
+		m.suggestion = "" // Clear suggestion when navigating history
+		m.suggestionPopup.Hide()
+		return m.navigateHistory(1)
 	}
 
 	var cmd tea.Cmd
 	m.editor, cmd = m.editor.Update(msg)
+
+	// Trigger local autocomplete on typing
+	if len(msg.String()) == 1 || msg.String() == "backspace" || msg.String() == "delete" {
+		m.suggestion = ""
+		m.suggestionDebounceTag++
+
+		// Update local autocomplete immediately
+		m.updateLocalSuggestions()
+
+		return m, tea.Batch(cmd, waitForDebounce(m.suggestionDebounceTag))
+	}
+
 	return m, cmd
 }
 
@@ -483,9 +585,83 @@ func (m Model) updateRowDetailView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.detailScrollPos = maxScroll
 		}
 		return m, nil
+
+	case "h":
+		// Toggle hiding empty fields
+		m.hideEmptyFields = !m.hideEmptyFields
+		m.detailScrollPos = 0 // Reset scroll when toggling
+		return m, nil
 	}
 
 	_ = row // Suppress unused warning
+	return m, nil
+}
+
+func (m Model) updateTemplatesView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Handle save template dialog
+	if m.savingTemplate {
+		switch msg.String() {
+		case "enter":
+			name := m.templateInput.Value()
+			if name != "" {
+				m.templates.Add(name, m.editor.Value(), "", nil)
+				m.templates.Save()
+			}
+			m.savingTemplate = false
+			return m, nil
+		case "esc":
+			m.savingTemplate = false
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.templateInput, cmd = m.templateInput.Update(msg)
+		return m, cmd
+	}
+
+	switch msg.String() {
+	case "enter":
+		if m.templateIndex >= 0 && m.templateIndex < len(m.templateList) {
+			m.editor.SetValue(m.templateList[m.templateIndex].Query)
+			m.templates.IncrementUseCount(m.templateList[m.templateIndex].ID)
+			m.templates.Save()
+			m.currentView = ViewQuery
+			m.editor.Focus()
+		}
+		return m, nil
+
+	case "d":
+		if len(m.templateList) > 0 && m.templateIndex < len(m.templateList) {
+			m.templates.Delete(m.templateList[m.templateIndex].ID)
+			m.templates.Save()
+			m.templateList = m.templates.GetAll()
+			if m.templateIndex >= len(m.templateList) && m.templateIndex > 0 {
+				m.templateIndex--
+			}
+		}
+		return m, nil
+
+	case "up", "k":
+		if m.templateIndex > 0 {
+			m.templateIndex--
+		}
+		return m, nil
+
+	case "down", "j":
+		if m.templateIndex < len(m.templateList)-1 {
+			m.templateIndex++
+		}
+		return m, nil
+
+	case "n":
+		// Create new template from current query (if any)
+		if m.editor.Value() != "" {
+			m.savingTemplate = true
+			m.templateInput.SetValue("")
+			m.templateInput.Focus()
+		}
+		return m, nil
+	}
+
 	return m, nil
 }
 
@@ -495,6 +671,9 @@ func (m Model) executeQuery() (tea.Model, tea.Cmd) {
 		m.lastError = "Query cannot be empty"
 		return m, nil
 	}
+
+	// Add default limit if query doesn't specify one
+	query = ensureQueryLimit(query, 100)
 
 	m.loading = true
 	m.lastQuery = query
@@ -510,6 +689,29 @@ func (m Model) executeQuery() (tea.Model, tea.Cmd) {
 			return queryResultMsg{result: result, err: err}
 		},
 	)
+}
+
+// ensureQueryLimit adds a limit to the query if one isn't already specified
+func ensureQueryLimit(query string, defaultLimit int) string {
+	queryLower := strings.ToLower(query)
+
+	// Check if query already has a limit (take, limit, or top)
+	limitKeywords := []string{"| take ", "|take ", "| limit ", "|limit ", "| top ", "|top "}
+	for _, kw := range limitKeywords {
+		if strings.Contains(queryLower, kw) {
+			return query // Already has a limit
+		}
+	}
+
+	// Also check for limit at the very end without space after pipe
+	if strings.HasSuffix(queryLower, "| take") || strings.HasSuffix(queryLower, "|take") ||
+		strings.HasSuffix(queryLower, "| limit") || strings.HasSuffix(queryLower, "|limit") ||
+		strings.HasSuffix(queryLower, "| top") || strings.HasSuffix(queryLower, "|top") {
+		return query // User is typing a limit
+	}
+
+	// Add default limit
+	return fmt.Sprintf("%s | take %d", query, defaultLimit)
 }
 
 func (m *Model) processResults(result *azure.QueryResult) {
@@ -579,6 +781,7 @@ func (m *Model) addToHistory(success bool, errMsg string) {
 func (m *Model) saveState() {
 	m.history.Save()
 	m.config.Save()
+	m.templates.Save()
 }
 
 // loadAvailableTables fetches available tables for autocomplete context
@@ -594,15 +797,39 @@ func (m *Model) loadAvailableTables() tea.Cmd {
 	}
 }
 
+// fetchInitialSchemas fetches schemas for the top available tables
+func (m *Model) fetchInitialSchemas(tables []string) tea.Cmd {
+	var cmds []tea.Cmd
+	// Fetch schema for up to 10 common tables
+	limit := 10
+	if len(tables) < limit {
+		limit = len(tables)
+	}
+
+	for i := 0; i < limit; i++ {
+		table := tables[i]
+		cmds = append(cmds, func() tea.Msg {
+			if m.client == nil {
+				return nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			columns, err := m.client.GetTableSchema(ctx, table)
+			return schemaMsg{tableName: table, columns: columns, err: err}
+		})
+	}
+	return tea.Batch(cmds...)
+}
+
 // getSuggestion fetches a query suggestion from OpenAI
-func (m *Model) getSuggestion() tea.Cmd {
+func (m *Model) getSuggestion(tag int) tea.Cmd {
 	return func() tea.Msg {
 		if m.openaiClient == nil {
-			return suggestionMsg{err: fmt.Errorf("OpenAI not available")}
+			return suggestionMsg{err: fmt.Errorf("OpenAI not available"), tag: tag}
 		}
 		query := m.editor.Value()
 		if query == "" {
-			return suggestionMsg{err: fmt.Errorf("empty query")}
+			return suggestionMsg{err: fmt.Errorf("empty query"), tag: tag}
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -613,8 +840,47 @@ func (m *Model) getSuggestion() tea.Cmd {
 		schemas := m.fetchSchemasForTables(ctx, referencedTables)
 
 		suggestion, err := m.openaiClient.SuggestKQLQuery(ctx, query, m.availableTables, schemas)
-		return suggestionMsg{suggestion: suggestion, err: err}
+		return suggestionMsg{suggestion: suggestion, err: err, tag: tag}
 	}
+}
+
+// updateLocalSuggestions updates the popup with local autocomplete suggestions
+func (m *Model) updateLocalSuggestions() {
+	query := m.editor.Value()
+	cursorPos := m.editor.CursorPosition()
+
+	// Parse context and get suggestions
+	ctx := m.autocompleteEngine.ParseContext(query, cursorPos)
+	suggestions := m.autocompleteEngine.GetSuggestions(ctx, 10)
+
+	// Filter out exact matches (already typed)
+	var filtered []Suggestion
+	for _, s := range suggestions {
+		if s.Text != ctx.CurrentWord {
+			filtered = append(filtered, s)
+		}
+	}
+
+	m.suggestionPopup.SetSuggestions(filtered)
+}
+
+// acceptLocalSuggestion accepts a suggestion from the popup
+func (m *Model) acceptLocalSuggestion(text string) {
+	query := m.editor.Value()
+	cursorPos := m.editor.CursorPosition()
+
+	// Parse context to find what to replace
+	ctx := m.autocompleteEngine.ParseContext(query, cursorPos)
+
+	// Build new query: text before current word + suggestion + text after cursor
+	beforeWord := query[:ctx.WordStartPos]
+	afterCursor := ""
+	if cursorPos < len(query) {
+		afterCursor = query[cursorPos:]
+	}
+
+	newQuery := beforeWord + text + afterCursor
+	m.editor.SetValue(newQuery)
 }
 
 // parseTablesFromQuery extracts table names from a KQL query
@@ -702,6 +968,8 @@ func (m Model) View() string {
 		b.WriteString(m.renderWorkspaceView())
 	case ViewRowDetail:
 		b.WriteString(m.renderRowDetailView())
+	case ViewTemplates:
+		b.WriteString(m.renderTemplatesView())
 	}
 
 	// Error message
@@ -763,20 +1031,36 @@ func (m Model) renderMainView() string {
 	// Query editor
 	b.WriteString(m.editor.View())
 
-	// Show suggestion or loading indicator
-	if m.suggestLoading {
+	// Local autocomplete popup (takes priority)
+	if m.suggestionPopup.IsVisible() {
 		b.WriteString("\n")
-		b.WriteString(m.spinner.View() + " " + m.styles.Muted.Render("Getting AI suggestion..."))
+		b.WriteString(m.suggestionPopup.View())
+	} else if m.suggestLoading {
+		// Show AI suggestion loading indicator
+		b.WriteString("\n")
+		b.WriteString(m.styles.Muted.Render(" Getting AI suggestion..."))
 	} else if m.suggestion != "" {
+		// Show AI suggestion ghost text
 		b.WriteString("\n")
-		b.WriteString(m.styles.Subtitle.Render("AI Suggestion (Tab to accept, Esc to dismiss):"))
+
+		// Calculate ghost text
+		current := m.editor.Value()
+		suggestion := m.suggestion
+		var preview string
+
+		if strings.HasPrefix(suggestion, current) && len(suggestion) > len(current) {
+			// Suggestion extends current input - Ghost text style
+			ghost := suggestion[len(current):]
+			preview = m.styles.Bold.Render(current) + m.styles.Muted.Render(ghost)
+		} else {
+			// Suggestion is different or shorter - Show full suggestion muted
+			preview = m.styles.Muted.Render(suggestion)
+		}
+
+		// Simple instructions
+		b.WriteString(preview)
 		b.WriteString("\n")
-		// Show suggestion in a box
-		suggestionBox := m.styles.Box.
-			BorderForeground(ColorSecondary).
-			Width(m.width - 8).
-			Render(m.suggestion)
-		b.WriteString(suggestionBox)
+		b.WriteString(m.styles.Muted.Render(" [Tab] to accept · [Esc] to dismiss"))
 	}
 
 	b.WriteString("\n\n")
@@ -832,6 +1116,57 @@ func (m Model) renderHistoryView() string {
 	return b.String()
 }
 
+func (m Model) renderTemplatesView() string {
+	var b strings.Builder
+
+	b.WriteString(m.styles.Header.Render("Query Templates"))
+	b.WriteString("\n\n")
+
+	// Handle save template dialog overlay
+	if m.savingTemplate {
+		b.WriteString("Save Current Query as Template\n\n")
+		b.WriteString("Name: ")
+		b.WriteString(m.templateInput.View())
+		b.WriteString("\n\n")
+		b.WriteString(m.styles.Muted.Render("Press Enter to save, Esc to cancel"))
+		return b.String()
+	}
+
+	if len(m.templateList) == 0 {
+		b.WriteString(m.styles.Muted.Render("No templates saved yet."))
+		b.WriteString("\n\n")
+		b.WriteString(m.styles.Muted.Render("Press Ctrl+S or F6 in query view to save current query as template."))
+		return b.String()
+	}
+
+	for i, tmpl := range m.templateList {
+		prefix := "  "
+		style := m.styles.Muted
+		if i == m.templateIndex {
+			prefix = "▶ "
+			style = m.styles.Bold
+		}
+
+		name := tmpl.Name
+		query := truncateString(tmpl.Query, 50)
+		uses := ""
+		if tmpl.UseCount > 0 {
+			uses = fmt.Sprintf(" (%d uses)", tmpl.UseCount)
+		}
+
+		line := fmt.Sprintf("%s%s: %s%s", prefix, name, query, uses)
+		b.WriteString(style.Render(line))
+		b.WriteString("\n")
+
+		if i >= 20 {
+			b.WriteString(m.styles.Muted.Render(fmt.Sprintf("  ... and %d more", len(m.templateList)-20)))
+			break
+		}
+	}
+
+	return b.String()
+}
+
 func (m Model) renderHelpView() string {
 	help := `
 AZURE LOG ANALYTICS CLI - HELP
@@ -841,15 +1176,17 @@ NAVIGATION
   F1            Show this help
   F2            Show query history
   F3            Change workspace
+  F4            Show saved templates
   Esc           Return to query view / Dismiss suggestion
   Ctrl+Q        Quit
 
 QUERY EDITOR
   F5, Ctrl+Enter   Execute query
   Ctrl+Space       AI query suggestion (Azure OpenAI)
+  Ctrl+S, F6       Save query as template
   Tab              Accept AI suggestion (when shown)
   Ctrl+L           Clear editor
-  Up/Down          Navigate query history
+  Ctrl+Up/Down     Navigate query history
 
 RESULTS TABLE
   j/k, Up/Down     Navigate rows
@@ -910,41 +1247,70 @@ func (m Model) renderRowDetailView() string {
 		return b.String()
 	}
 
+	// Build list of fields to display (filter empty if enabled)
+	type fieldInfo struct {
+		name  string
+		value string
+	}
+	var fields []fieldInfo
+	totalFields := len(columns)
+
+	for i, col := range columns {
+		if i >= len(row) {
+			break
+		}
+		value := row[i]
+		// Skip empty fields if hiding is enabled
+		if m.hideEmptyFields && value == "" {
+			continue
+		}
+		fields = append(fields, fieldInfo{name: col, value: value})
+	}
+
 	// Calculate visible rows based on height
 	visibleRows := m.height - 12
 	if visibleRows < 5 {
 		visibleRows = 5
 	}
 
+	// Adjust scroll position if it exceeds filtered list
+	maxScroll := len(fields) - 1
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	scrollPos := m.detailScrollPos
+	if scrollPos > maxScroll {
+		scrollPos = maxScroll
+	}
+
 	// Show fields with scroll
-	endIdx := m.detailScrollPos + visibleRows
-	if endIdx > len(columns) {
-		endIdx = len(columns)
+	endIdx := scrollPos + visibleRows
+	if endIdx > len(fields) {
+		endIdx = len(fields)
 	}
 
 	// Calculate max column name width for alignment
 	maxNameWidth := 0
-	for _, col := range columns {
-		if len(col) > maxNameWidth {
-			maxNameWidth = len(col)
+	for _, f := range fields {
+		if len(f.name) > maxNameWidth {
+			maxNameWidth = len(f.name)
 		}
 	}
 	if maxNameWidth > 30 {
 		maxNameWidth = 30
 	}
 
-	for i := m.detailScrollPos; i < endIdx && i < len(row); i++ {
-		colName := columns[i]
-		value := row[i]
+	for i := scrollPos; i < endIdx; i++ {
+		f := fields[i]
 
 		// Highlight current scroll position
 		prefix := "  "
-		if i == m.detailScrollPos {
+		if i == scrollPos {
 			prefix = "▶ "
 		}
 
 		// Format column name with padding
-		paddedName := colName
+		paddedName := f.name
 		if len(paddedName) > maxNameWidth {
 			paddedName = paddedName[:maxNameWidth-3] + "..."
 		}
@@ -952,8 +1318,8 @@ func (m Model) renderRowDetailView() string {
 			paddedName += " "
 		}
 
-		// Format value - wrap long values
-		valueStr := value
+		// Format value
+		valueStr := f.value
 		if valueStr == "" {
 			valueStr = m.styles.Muted.Render("(empty)")
 		}
@@ -966,16 +1332,19 @@ func (m Model) renderRowDetailView() string {
 		b.WriteString("\n")
 	}
 
-	// Scroll indicator
-	if len(columns) > visibleRows {
-		b.WriteString("\n")
-		scrollInfo := fmt.Sprintf("Showing fields %d-%d of %d (scroll with j/k or arrows)",
-			m.detailScrollPos+1, endIdx, len(columns))
+	// Scroll indicator with filter info
+	b.WriteString("\n")
+	if m.hideEmptyFields {
+		scrollInfo := fmt.Sprintf("Showing %d/%d fields (hiding %d empty) · h to show all",
+			len(fields), totalFields, totalFields-len(fields))
+		b.WriteString(m.styles.Muted.Render(scrollInfo))
+	} else {
+		scrollInfo := fmt.Sprintf("Showing all %d fields · h to hide empty", totalFields)
 		b.WriteString(m.styles.Muted.Render(scrollInfo))
 	}
 
 	b.WriteString("\n\n")
-	b.WriteString(m.styles.Muted.Render("Press Esc, Enter, or Q to return to results"))
+	b.WriteString(m.styles.Muted.Render("j/k to scroll · Esc to return"))
 
 	return b.String()
 }
@@ -990,7 +1359,7 @@ func (m Model) renderFooter() string {
 			m.styles.HelpKey.Render("Ctrl+Space") + " AI Suggest",
 			m.styles.HelpKey.Render("Tab") + " Results",
 			m.styles.HelpKey.Render("F2") + " History",
-			m.styles.HelpKey.Render("F3") + " Workspace",
+			m.styles.HelpKey.Render("F4") + " Templates",
 			m.styles.HelpKey.Render("Ctrl+Q") + " Quit",
 		}
 	case ViewResults:
@@ -1009,6 +1378,13 @@ func (m Model) renderFooter() string {
 	case ViewHistory:
 		keys = []string{
 			m.styles.HelpKey.Render("Enter") + " Select",
+			m.styles.HelpKey.Render("j/k") + " Navigate",
+			m.styles.HelpKey.Render("Esc") + " Back",
+		}
+	case ViewTemplates:
+		keys = []string{
+			m.styles.HelpKey.Render("Enter") + " Load",
+			m.styles.HelpKey.Render("d") + " Delete",
 			m.styles.HelpKey.Render("j/k") + " Navigate",
 			m.styles.HelpKey.Render("Esc") + " Back",
 		}

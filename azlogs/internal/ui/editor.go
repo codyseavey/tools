@@ -118,41 +118,144 @@ func (e QueryEditor) IsFocused() bool {
 	return e.focused
 }
 
-// HighlightKQL applies basic syntax highlighting to KQL
+// CursorPosition returns the absolute cursor position in the text
+func (e QueryEditor) CursorPosition() int {
+	value := e.textarea.Value()
+	lines := strings.Split(value, "\n")
+	line := e.textarea.Line()
+	info := e.textarea.LineInfo()
+
+	pos := 0
+	for i := 0; i < line && i < len(lines); i++ {
+		pos += len(lines[i]) + 1 // +1 for newline
+	}
+	return pos + info.CharOffset
+}
+
+// InsertText inserts text at the current cursor position
+func (e *QueryEditor) InsertText(text string) {
+	e.textarea.InsertString(text)
+}
+
+// Highlight styles
+var (
+	keywordStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5c6bc0")).Bold(true)
+	operatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff9800"))
+	pipeStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#757575")).Bold(true)
+	stringStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#4caf50"))
+	numberStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#e91e63"))
+	functionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffc107"))
+)
+
+// HighlightKQL applies syntax highlighting to KQL
 func HighlightKQL(query string) string {
-	result := query
-
-	// Highlight keywords
-	keywordStyle := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
-	for _, kw := range kqlKeywords {
-		// Case-insensitive replacement
-		lowerQuery := strings.ToLower(result)
-		lowerKw := strings.ToLower(kw)
-
-		for {
-			idx := strings.Index(strings.ToLower(result), lowerKw)
-			if idx == -1 {
-				break
-			}
-
-			// Check word boundaries
-			isWordStart := idx == 0 || !isAlphaNum(result[idx-1])
-			isWordEnd := idx+len(kw) == len(result) || !isAlphaNum(result[idx+len(kw)])
-
-			if isWordStart && isWordEnd {
-				highlighted := keywordStyle.Render(result[idx : idx+len(kw)])
-				result = result[:idx] + highlighted + result[idx+len(kw):]
-				// Move past the highlighted text
-				break
-			}
-			_ = lowerQuery // Suppress unused variable warning
-			break
-		}
+	if query == "" {
+		return query
 	}
 
-	return result
+	var result strings.Builder
+	i := 0
+
+	for i < len(query) {
+		// Check for pipe
+		if query[i] == '|' {
+			result.WriteString(pipeStyle.Render("|"))
+			i++
+			continue
+		}
+
+		// Check for string literals
+		if query[i] == '"' || query[i] == '\'' {
+			quote := query[i]
+			start := i
+			i++
+			for i < len(query) && query[i] != quote {
+				if query[i] == '\\' && i+1 < len(query) {
+					i++ // Skip escaped char
+				}
+				i++
+			}
+			if i < len(query) {
+				i++ // Include closing quote
+			}
+			result.WriteString(stringStyle.Render(query[start:i]))
+			continue
+		}
+
+		// Check for numbers
+		if isDigit(query[i]) {
+			start := i
+			for i < len(query) && (isDigit(query[i]) || query[i] == '.') {
+				i++
+			}
+			result.WriteString(numberStyle.Render(query[start:i]))
+			continue
+		}
+
+		// Check for words (keywords, identifiers)
+		if isAlphaStart(query[i]) {
+			start := i
+			for i < len(query) && isAlphaNum(query[i]) {
+				i++
+			}
+			word := query[start:i]
+
+			// Check if followed by ( for function highlighting
+			isFunc := i < len(query) && query[i] == '('
+
+			// Check if it's a keyword
+			if isKQLKeyword(word) {
+				result.WriteString(keywordStyle.Render(word))
+			} else if isFunc {
+				result.WriteString(functionStyle.Render(word))
+			} else {
+				result.WriteString(word)
+			}
+			continue
+		}
+
+		// Check for comparison operators
+		if i+1 < len(query) {
+			twoChar := query[i : i+2]
+			if twoChar == "==" || twoChar == "!=" || twoChar == "<=" || twoChar == ">=" {
+				result.WriteString(operatorStyle.Render(twoChar))
+				i += 2
+				continue
+			}
+		}
+
+		if query[i] == '<' || query[i] == '>' || query[i] == '=' {
+			result.WriteString(operatorStyle.Render(string(query[i])))
+			i++
+			continue
+		}
+
+		// Default: write character as-is
+		result.WriteByte(query[i])
+		i++
+	}
+
+	return result.String()
 }
 
 func isAlphaNum(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+func isAlphaStart(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+func isDigit(c byte) bool {
+	return c >= '0' && c <= '9'
+}
+
+func isKQLKeyword(word string) bool {
+	lower := strings.ToLower(word)
+	for _, kw := range kqlKeywords {
+		if strings.ToLower(kw) == lower {
+			return true
+		}
+	}
+	return false
 }
